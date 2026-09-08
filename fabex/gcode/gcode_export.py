@@ -86,6 +86,7 @@ def export_gcode_path(filename, vertslist, operations):
 
     processor_extension = {
         "ANILAM": ("anilam_crusader_m", ".tap"),
+        "BIESSE_CIX": ("biesse_cix", ".cix"),
         "CENTROID": ("centroid1", ".tap"),
         "EMC": ("emc2b", ".ngc"),
         "FADAL": ("fadal", ".tap"),
