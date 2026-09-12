@@ -202,6 +202,12 @@ def export_gcode_path(filename, vertslist, operations):
 
         if o.machine_axes != "3":
             rots = mesh.shape_keys.key_blocks["rotations"].data
+            if hasattr(c, "write_wfl_macro") and len(rots) > 0:
+                # INDEXED (3+2) operation: the compound tilt is constant
+                # for the whole operation, so read it once from the first
+                # vertex's stored rotation rather than per-point.
+                cangle, tilt, _unused = rots[0].co
+                c.write_wfl_macro(cangle, tilt)
 
         # spindle rpm and direction
         spdir_clockwise = o.movement.spindle_rotation == "CW"
@@ -214,6 +220,7 @@ def export_gcode_path(filename, vertslist, operations):
             o.cutter_type,
             o.cutter_flutes,
         ]:
+            c.current_operation = o
             c.tool_change(o.cutter_id)
 
         if m.output_tool_definitions:
