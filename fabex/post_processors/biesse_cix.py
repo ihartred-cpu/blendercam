@@ -69,8 +69,38 @@ class Creator(IsoCreator):
             x, y, z = 0.0, 0.0, 0.0
         return x, y, z
 
+    def _set_z_shift(self):
+        # CIX's confirmed real convention (from the actual R370104N.cix
+        # vendor file): Z=0 at the panel's TOP surface, negative Z going
+        # down into material. The base framework's shift_z mechanism
+        # (translate()) exists for exactly this but was never being
+        # called anywhere - raw Blender Z was passing straight through
+        # unshifted, meaning the output's Z=0 reference silently drifted
+        # with whatever Blender's own "material Z placement" setting
+        # happened to be, rather than tracking the panel's real top
+        # surface. Confirmed via real testing: two different material Z
+        # placement settings produced two different (both wrong) depth
+        # behaviours - one plunging into the spoilboard, one plunging the
+        # full tool length.
+        #
+        # shift_z is added AFTER feed()/rapid() already convert to mm
+        # (gcode_export.py's vz = v.z * unitcorr), so it must be supplied
+        # in mm here too, matching the same *1000 assumption _panel_dims()
+        # already makes.
+        try:
+            import bpy
+
+            ops = bpy.context.scene.cam_operations
+            if len(ops) == 0:
+                return
+            max_z_m = max(o.max.z for o in ops)
+            self.shift_z = -max_z_m * 1000.0
+        except Exception:
+            pass
+
     def _write_cix_header(self):
         lpx, lpy, lpz = self._panel_dims()
+        self._set_z_shift()
         self.file.write("BEGIN ID CID3\n")
         self.file.write("  REL=5.0\n")
         self.file.write("END ID\n")
@@ -157,7 +187,33 @@ class Creator(IsoCreator):
         # to self.file - iso.py's feed()/rapid() use this for every axis
         # word (X/Y/Z/A/B/C), so without this override every coordinate
         # would slip past the CIX-wrapping logic above.
+        #
+        # Reverted to the original "".join(a) - now that SPACE() itself
+        # is fixed to always return a real space (the actual root cause,
+        # see SPACE() override below), this join is correct again:
+        # calls look like [SPACE(), "Z", "-10"] where SPACE() already
+        # contributes the needed leading separator and the letter+value
+        # must concatenate directly into "Z-10". An earlier attempt to
+        # fix this by always joining with a space here was an
+        # overcorrection - it fixed nothing SPACE() didn't already fix,
+        # and actively broke this case by inserting an unwanted space
+        # between the axis letter and its value ("Z -10" instead of
+        # "Z-10"), confirmed via a real "bad instruction beginning" error.
         self.write("".join(a))
+
+    def SPACE(self):
+        # ROOT CAUSE of the G17G90/S15000M03/G00X0Y0Z10 concatenation
+        # bugs: the base framework's SPACE()/SPACE_STR() always return
+        # "" (empty), a deliberate design choice for dialects where
+        # letter-prefixed words are self-delimiting (X10Y20 parses fine
+        # without a literal space in many controls). Confirmed via real
+        # machine errors on both this post and the Fusion-side post that
+        # Biesse's CID3 dialect does NOT tolerate this - not even for
+        # same-letter pairs (G17/G90) or different-letter pairs (S/M).
+        # Always return a real space so every write_preps()/Address.write()
+        # call site throughout the inherited codebase gets correct
+        # separation, not just the axis-word case writem() already covers.
+        return " "
 
     ############################################################################
     # Program start/end - CID3's own header/MAINDATA replaces the usual
@@ -222,7 +278,16 @@ class Creator(IsoCreator):
         return wfl_id
 
     def PROGRAM_END(self):
-        return "TP0"
+        # Confirmed via a real CV production file (R370104N.cix): the
+        # program simply ends after the last ENDPATH - no explicit TP0,
+        # no M-code, nothing. Emitting an explicit TP0 here is very
+        # likely what triggers the machine's own automatic tool-release
+        # rotation (uncompensated, confirmed via an isolated test to
+        # cause a real plunge) - CV's real files never do this, so the
+        # machine evidently doesn't need an explicit release instruction
+        # at the end of a program at all. Return empty - nothing gets
+        # emitted (an empty ISO row is stripped and skipped).
+        return ""
 
     def comment(self, text):
         # Suppress Fabex's identification/info comments (version banner,
@@ -291,7 +356,120 @@ class Creator(IsoCreator):
         op = getattr(self, "current_operation", None)
         diameter_mm = (op.cutter_diameter * 1000.0) if op is not None else 12.7
         tool_name = (op.cutter_description if op is not None else "") or f"T{id}"
+        rpm = getattr(op, "spindle_rpm", 0) if op is not None else 0
+        self.t = id
+        self.move_done_since_tool_change = False
 
+        # FIRST-DRAFT native-geometry path, scoped specifically to
+        # CUTOUT-strategy operations (not general - pockets, drilling,
+        # etc. still fall through to the placeholder-ROUT + embedded-ISO
+        # motion approach below). Confirmed via all 4 real CV production
+        # files that native ROUT (not ROUTG/GEO) is what real production
+        # actually uses, even for real cuts - none of them use ROUTG at
+        # all. For a simple rectangular cutout (matching the real
+        # operation's own bounding box), ROUT's own DX/DY/XRC/YRC fields
+        # can represent the real shape directly, with bSuite generating
+        # the actual toolpath itself - no embedded ISO motion needed.
+        is_native_cutout = op is not None and getattr(op, "strategy", None) == "CUTOUT"
+        self._native_cutout_active = False
+
+        # NOTE: DRILL strategy intentionally does NOT get the same
+        # blanket suppression as CUTOUT. Confirmed via real testing that
+        # at least one drill type (MIDDLE_SYMETRIC) generates a real,
+        # substantial toolpath (193 points for a single hole) through
+        # ordinary rapid()/feed() calls, not the dedicated drill()
+        # method below - unconditionally suppressing motion for any
+        # DRILL-strategy operation silently ate that real toolpath,
+        # leaving nothing for bSolid to show at all. drill() is kept as
+        # an available override for whichever drill types genuinely do
+        # invoke it, but nothing here assumes DRILL strategy implies
+        # drill() will be called - the fallback embedded-ISO path below
+        # handles real motion correctly regardless of drill type.
+
+        if is_native_cutout:
+            try:
+                import bpy
+
+                all_ops = bpy.context.scene.cam_operations
+                panel_min_x = min(o.min.x for o in all_ops) * 1000.0
+                panel_min_y = min(o.min.y for o in all_ops) * 1000.0
+
+                op_min_x = op.min.x * 1000.0 - panel_min_x
+                op_max_x = op.max.x * 1000.0 - panel_min_x
+                op_min_y = op.min.y * 1000.0 - panel_min_y
+                op_max_y = op.max.y * 1000.0 - panel_min_y
+                xrc = (op_min_x + op_max_x) / 2.0
+                yrc = (op_min_y + op_max_y) / 2.0
+                dx = op_max_x - op_min_x
+                dy = op_max_y - op_min_y
+
+                # Real per-layer depths, matching Fabex's own internal
+                # layer calculation (confirmed via the real log output:
+                # "Layer 0 Depth: -0.01, Layer 1 Depth: -0.019" for a
+                # stepdown of 10mm and max depth of 19mm) - computed here
+                # from the same op.stepdown/min_z/max_z rather than
+                # inferring layer boundaries from the raw vertex stream.
+                #
+                # POSITIVE here, not negative - confirmed via direct, twice-
+                # repeated real simulation evidence (with and without
+                # AZ=90) that negative DP produces upward motion for this
+                # macro on this machine, contradicting an earlier
+                # inference drawn from reading a reference file's text
+                # rather than simulating it directly. Trusting the real,
+                # repeated empirical result over that indirect reading.
+                max_depth_mm = abs(op.max_z - op.min_z) * 1000.0
+                stepdown_mm = abs(getattr(op, "stepdown", 0)) * 1000.0 or abs(max_depth_mm)
+                depths = []
+                d = stepdown_mm
+                while d < max_depth_mm:
+                    depths.append(d)
+                    d += stepdown_mm
+                depths.append(max_depth_mm)
+
+                if dx > 0 and dy > 0 and depths:
+                    for depth in depths:
+                        rout_id = getattr(self, "_rout_id_counter", 1001)
+                        self._rout_id_counter = rout_id + 1
+                        self.file.write("BEGIN MACRO\n")
+                        self.file.write("        NAME=ROUT\n")
+                        self.file.write(f'        PARAM,NAME=ID,VALUE="P{rout_id}"\n')
+                        self.file.write("        PARAM,NAME=SIDE,VALUE=0\n")
+                        self.file.write('        PARAM,NAME=CRN,VALUE="1"\n')
+                        self.file.write("        PARAM,NAME=Z,VALUE=0\n")
+                        self.file.write(f"        PARAM,NAME=DP,VALUE={depth:.4f}\n")
+                        self.file.write("        PARAM,NAME=OPT,VALUE=NO\n")
+                        self.file.write(f"        PARAM,NAME=DIA,VALUE={diameter_mm:.3f}\n")
+                        self.file.write("        PARAM,NAME=AZ,VALUE=90\n")
+                        self.file.write("        PARAM,NAME=RTY,VALUE=rpNO\n")
+                        self.file.write(f"        PARAM,NAME=XRC,VALUE={xrc:.4f}\n")
+                        self.file.write(f"        PARAM,NAME=YRC,VALUE={yrc:.4f}\n")
+                        self.file.write(f"        PARAM,NAME=DX,VALUE={dx:.4f}\n")
+                        self.file.write(f"        PARAM,NAME=DY,VALUE={dy:.4f}\n")
+                        self.file.write("        PARAM,NAME=R,VALUE=0\n")
+                        self.file.write("        PARAM,NAME=A,VALUE=0\n")
+                        self.file.write("        PARAM,NAME=THR,VALUE=NO\n")
+                        self.file.write("        PARAM,NAME=RV,VALUE=NO\n")
+                        self.file.write("        PARAM,NAME=CRC,VALUE=0\n")
+                        self.file.write(f"        PARAM,NAME=RSP,VALUE={rpm:.0f}\n")
+                        self.file.write(f'        PARAM,NAME=TNM,VALUE="{tool_name}"\n')
+                        self.file.write("END MACRO\n\n")
+                        self.file.write("BEGIN MACRO\n")
+                        self.file.write("        NAME=ENDPATH\n")
+                        self.file.write("END MACRO\n\n")
+                    self._native_cutout_active = True
+            except Exception:
+                self._native_cutout_active = False
+
+        if self._native_cutout_active:
+            # Real cutting motion now comes entirely from the native ROUT
+            # macros above - suppress the embedded-ISO per-vertex motion
+            # for this operation (see rapid()/feed() overrides below).
+            return
+
+        # Fallback: placeholder-rectangle tool activation only (does NOT
+        # represent real cutting geometry) - embedded-ISO motion below
+        # still does the actual cutting, same as before. Used for any
+        # operation NOT recognized as a simple CUTOUT above.
         rout_id = getattr(self, "_rout_id_counter", 1001)
         self._rout_id_counter = rout_id + 1
 
@@ -301,9 +479,10 @@ class Creator(IsoCreator):
         self.file.write("        PARAM,NAME=SIDE,VALUE=0\n")
         self.file.write('        PARAM,NAME=CRN,VALUE="1"\n')
         self.file.write("        PARAM,NAME=Z,VALUE=0\n")
-        self.file.write("        PARAM,NAME=DP,VALUE=1\n")
+        self.file.write("        PARAM,NAME=DP,VALUE=-1\n")
         self.file.write("        PARAM,NAME=OPT,VALUE=NO\n")
         self.file.write(f"        PARAM,NAME=DIA,VALUE={diameter_mm:.3f}\n")
+        self.file.write("        PARAM,NAME=AZ,VALUE=90\n")
         self.file.write("        PARAM,NAME=RTY,VALUE=rpNO\n")
         self.file.write("        PARAM,NAME=XRC,VALUE=16\n")
         self.file.write("        PARAM,NAME=YRC,VALUE=16\n")
@@ -314,14 +493,29 @@ class Creator(IsoCreator):
         self.file.write("        PARAM,NAME=THR,VALUE=NO\n")
         self.file.write("        PARAM,NAME=RV,VALUE=NO\n")
         self.file.write("        PARAM,NAME=CRC,VALUE=0\n")
+        self.file.write(f"        PARAM,NAME=RSP,VALUE={rpm:.0f}\n")
         self.file.write(f'        PARAM,NAME=TNM,VALUE="{tool_name}"\n')
         self.file.write("END MACRO\n\n")
         self.file.write("BEGIN MACRO\n")
         self.file.write("        NAME=ENDPATH\n")
         self.file.write("END MACRO\n\n")
 
-        self.t = id
-        self.move_done_since_tool_change = False
+        # Confirmed required (Fusion-side nickel-and-dime testing): a bare
+        # G179 line must come right after tool activation, before ANY
+        # embedded-ISO motion - even plain 3-axis moves with no rotary
+        # component - or bSuite rejects the first move as a "non-existing
+        # axis"/instruction error. Never carried over to this post before.
+        self._emit_iso_row("G179")
+
+    def rapid(self, x=None, y=None, z=None, a=None, b=None, c=None):
+        if getattr(self, "_native_cutout_active", False):
+            return
+        super().rapid(x=x, y=y, z=z, a=a, b=b, c=c)
+
+    def feed(self, x=None, y=None, z=None, a=None, b=None, c=None):
+        if getattr(self, "_native_cutout_active", False):
+            return
+        super().feed(x=x, y=y, z=z, a=a, b=b, c=c)
 
     def write_noprk(self, start, distance=400):
         # Native NOPRK "magic comment" directive - confirmed via real
@@ -339,11 +533,37 @@ class Creator(IsoCreator):
         else:
             self._emit_iso_row(";NOPRKEND")
 
+    def spindle(self, s, clockwise):
+        # No-op: the native ROUT macro (see tool_change()) already
+        # activates the tool and spindle internally, with its own RSP
+        # (speed) parameter. A separate embedded "S<rpm> M03" row here
+        # is redundant and confirmed harmful - real testing on the
+        # Fusion-side post found this exact pattern produces "no
+        # spindles selected"/"M instruction error", since bSuite refuses
+        # to re-activate a spindle that a native macro already started.
+        pass
+
+    def write_spindle(self):
+        # Paired no-op with spindle() above - nothing was queued to flush.
+        pass
+
     def TOOL(self):
         # Not used directly since tool_change() is overridden above,
         # but defined for completeness / in case any base-class path
         # still calls it.
         return "TP=%i"
+
+    ############################################################################
+    # Drilling - NOT overridden. A native BG-macro override was tried and
+    # reverted: real testing confirmed at least one drill type
+    # (MIDDLE_SYMETRIC) generates its real toolpath through ordinary
+    # rapid()/feed() calls, not this method, and genuine uncertainty
+    # remains about which drill types (if any) actually invoke it.
+    # Falling through to the base framework's own drill() implementation
+    # (already used successfully by other real posts in this codebase,
+    # e.g. heiden.py) avoids a redundant-activation risk against the
+    # reverted fallback ROUT, which now always runs for DRILL-strategy
+    # operations regardless of drill type.
 
     ############################################################################
     # Spindle - Biesse dialect uses plain M3/M5, no S-word peculiarities

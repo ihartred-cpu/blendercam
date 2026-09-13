@@ -238,7 +238,7 @@ def export_gcode_path(filename, vertslist, operations):
 
             # Raise Z to job start height BEFORE spindle starts,
             # so the cutter clears toolsetters and fixtures
-            if m.use_job_start_height:
+            if m.use_job_start_height and not getattr(c, "_native_cutout_active", False):
                 jsh = round(m.job_start_height * unitcorr, 2)
                 c.write(f"G00 Z{jsh} F{frf}\n")
 
@@ -275,7 +275,11 @@ def export_gcode_path(filename, vertslist, operations):
 
         # Raise to free height. When job start height is active the first path
         # vertex already positions X, Y and Z, so this move is redundant.
-        if o.cutter_type not in ["LASER", "PLASMA"] and not m.use_job_start_height:
+        if (
+            o.cutter_type not in ["LASER", "PLASMA"]
+            and not m.use_job_start_height
+            and not getattr(c, "_native_cutout_active", False)
+        ):
             c.write(f"G00 Z{fmh} F{frf}\n")
 
         if o.enable_a_axis:
