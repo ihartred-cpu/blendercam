@@ -44,32 +44,35 @@ class Creator(IsoCreator):
     # CIX container structure
 
     def _panel_dims(self):
-        """Panel size in mm, computed from the real bounding box of the
-        operations being exported - NOT the machine's generic work-area
-        setting (that's the machine's travel limits, not this job's stock
-        size). Always converts Blender's native meters to mm, since CIX/
-        bSuite is always mm regardless of the Blender scene's display unit.
+        """Panel size in mm - the machine's real, configured working area.
+
+        PREVIOUSLY computed from the bounding box across all operations
+        in the scene. CONFIRMED WRONG via real testing: each operation's
+        own min/max is an independent material estimate derived from
+        THAT operation's own source object (Fabex's bounds_utils.py -
+        for a drill operation, that's just the tiny drill-point curve),
+        not a shared "panel" concept at the scene level. Since the real
+        workflow only ever posts one operation at a time, relying on
+        other operations' bounds being present/valid in the scene at
+        export time was fundamentally the wrong model - confirmed by a
+        real drill-only export reporting the drill geometry's own tiny
+        size as if it were the panel.
+
+        The machine's own configured working area is a stable,
+        machine-level setting that doesn't depend on which operation is
+        being posted - matches the user's own description of how bSolid
+        actually works: the real geometry sits inside a real containing
+        shape, not something inferred from whatever's being posted.
         """
         try:
             import bpy
 
-            ops = bpy.context.scene.cam_operations
-            if len(ops) == 0:
-                return 0.0, 0.0, 0.0
-            min_x = min(o.min.x for o in ops)
-            min_y = min(o.min.y for o in ops)
-            min_z = min(o.min.z for o in ops)
-            max_x = max(o.max.x for o in ops)
-            max_y = max(o.max.y for o in ops)
-            max_z = max(o.max.z for o in ops)
-            x = (max_x - min_x) * 1000.0
-            y = (max_y - min_y) * 1000.0
-            z = (max_z - min_z) * 1000.0
+            wa = bpy.context.scene.cam_machine.working_area
+            return wa.x * 1000.0, wa.y * 1000.0, wa.z * 1000.0
         except Exception:
-            x, y, z = 0.0, 0.0, 0.0
-        return x, y, z
+            return 0.0, 0.0, 0.0
 
-    def _set_z_shift(self):
+    def _set_z_shift(self, op):
         # CIX's confirmed real convention (from the actual R370104N.cix
         # vendor file): Z=0 at the panel's TOP surface, negative Z going
         # down into material. The base framework's shift_z mechanism
@@ -83,24 +86,24 @@ class Creator(IsoCreator):
         # behaviours - one plunging into the spoilboard, one plunging the
         # full tool length.
         #
+        # Takes the operation being exported directly (called from
+        # tool_change(), where it's already known) rather than scanning
+        # cam_operations - same reasoning as _panel_dims() above: this
+        # operation's own max_z is the only bounds guaranteed valid and
+        # relevant for what's actually being posted.
+        #
         # shift_z is added AFTER feed()/rapid() already convert to mm
         # (gcode_export.py's vz = v.z * unitcorr), so it must be supplied
-        # in mm here too, matching the same *1000 assumption _panel_dims()
-        # already makes.
+        # in mm here too.
+        if op is None:
+            return
         try:
-            import bpy
-
-            ops = bpy.context.scene.cam_operations
-            if len(ops) == 0:
-                return
-            max_z_m = max(o.max.z for o in ops)
-            self.shift_z = -max_z_m * 1000.0
+            self.shift_z = -op.max.z * 1000.0
         except Exception:
             pass
 
     def _write_cix_header(self):
         lpx, lpy, lpz = self._panel_dims()
-        self._set_z_shift()
         self.file.write("BEGIN ID CID3\n")
         self.file.write("  REL=5.0\n")
         self.file.write("END ID\n")
@@ -299,6 +302,11 @@ class Creator(IsoCreator):
         pass
 
     def program_end(self):
+        # Flush any drill points buffered for the last operation in the
+        # file - there's no subsequent tool_change() to trigger this
+        # otherwise.
+        self._flush_drill_buffer()
+
         # iso.py's program_end() runs a post-write pass (number_file()) that
         # reopens the finished file and prepends N<number> to every single
         # line - including CID3 keywords like "BEGIN MACRO" and "END MACRO".
@@ -353,12 +361,34 @@ class Creator(IsoCreator):
     # genuine positive depth (e.g. DP=5).
 
     def tool_change(self, id):
+        # Flush any drill points buffered for the PREVIOUS operation -
+        # tool_change() marks a new operation starting, so this is the
+        # right point to finalize whatever came before.
+        self._flush_drill_buffer()
+
         op = getattr(self, "current_operation", None)
         diameter_mm = (op.cutter_diameter * 1000.0) if op is not None else 12.7
         tool_name = (op.cutter_description if op is not None else "") or f"T{id}"
         rpm = getattr(op, "spindle_rpm", 0) if op is not None else 0
         self.t = id
         self.move_done_since_tool_change = False
+        self._set_z_shift(op)
+
+        # DRILL strategy: buffer rapid()/feed() calls instead of emitting
+        # them immediately, so the real motion pattern can be inspected
+        # once the operation completes (see _flush_drill_buffer()) - a
+        # clean plunge/retract cycle becomes a native BG macro (matching
+        # Biesse's real convention of wanting a location + parameters,
+        # not a pre-computed path - confirmed via real .arp mining
+        # tonight); anything more complex (e.g. a real helical drill
+        # type) falls back to the proven embedded-ISO path unchanged.
+        self._drill_buffering = op is not None and getattr(op, "strategy", None) == "DRILL"
+        if self._drill_buffering:
+            self._drill_buffer = []
+            self._drill_tool_name = tool_name
+            self._drill_diameter_mm = diameter_mm
+            self._drill_rpm = rpm
+            return
 
         # FIRST-DRAFT native-geometry path, scoped specifically to
         # CUTOUT-strategy operations (not general - pockets, drilling,
@@ -388,11 +418,13 @@ class Creator(IsoCreator):
 
         if is_native_cutout:
             try:
-                import bpy
-
-                all_ops = bpy.context.scene.cam_operations
-                panel_min_x = min(o.min.x for o in all_ops) * 1000.0
-                panel_min_y = min(o.min.y for o in all_ops) * 1000.0
+                # Origin reference is this operation's own min bounds -
+                # NOT a scan across other operations in the scene (that
+                # relied on other operations' bounds being present/valid
+                # at export time, which the real workflow doesn't
+                # guarantee - see _panel_dims() for the full reasoning).
+                panel_min_x = op.min.x * 1000.0
+                panel_min_y = op.min.y * 1000.0
 
                 op_min_x = op.min.x * 1000.0 - panel_min_x
                 op_max_x = op.max.x * 1000.0 - panel_min_x
@@ -470,6 +502,9 @@ class Creator(IsoCreator):
         # represent real cutting geometry) - embedded-ISO motion below
         # still does the actual cutting, same as before. Used for any
         # operation NOT recognized as a simple CUTOUT above.
+        self._write_fallback_tool_activation(tool_name, diameter_mm, rpm)
+
+    def _write_fallback_tool_activation(self, tool_name, diameter_mm, rpm):
         rout_id = getattr(self, "_rout_id_counter", 1001)
         self._rout_id_counter = rout_id + 1
 
@@ -479,7 +514,7 @@ class Creator(IsoCreator):
         self.file.write("        PARAM,NAME=SIDE,VALUE=0\n")
         self.file.write('        PARAM,NAME=CRN,VALUE="1"\n')
         self.file.write("        PARAM,NAME=Z,VALUE=0\n")
-        self.file.write("        PARAM,NAME=DP,VALUE=-1\n")
+        self.file.write("        PARAM,NAME=DP,VALUE=1\n")
         self.file.write("        PARAM,NAME=OPT,VALUE=NO\n")
         self.file.write(f"        PARAM,NAME=DIA,VALUE={diameter_mm:.3f}\n")
         self.file.write("        PARAM,NAME=AZ,VALUE=90\n")
@@ -510,12 +545,138 @@ class Creator(IsoCreator):
     def rapid(self, x=None, y=None, z=None, a=None, b=None, c=None):
         if getattr(self, "_native_cutout_active", False):
             return
+        if getattr(self, "_drill_buffering", False):
+            self._buffer_drill_move(True, x, y, z)
+            return
         super().rapid(x=x, y=y, z=z, a=a, b=b, c=c)
 
     def feed(self, x=None, y=None, z=None, a=None, b=None, c=None):
         if getattr(self, "_native_cutout_active", False):
             return
+        if getattr(self, "_drill_buffering", False):
+            self._buffer_drill_move(False, x, y, z)
+            return
         super().feed(x=x, y=y, z=z, a=a, b=b, c=c)
+
+    def _buffer_drill_move(self, is_rapid, x, y, z):
+        # x/y/z are None when unchanged from the last position (Fabex's
+        # modal convention - only changed axes are passed) - resolve
+        # against the last known position so the buffer holds real,
+        # absolute coordinates for later pattern analysis.
+        last = getattr(self, "_drill_last_xyz", (0.0, 0.0, 0.0))
+        rx = last[0] if x is None else x
+        ry = last[1] if y is None else y
+        rz = last[2] if z is None else z
+        self._drill_last_xyz = (rx, ry, rz)
+        self._drill_buffer.append((is_rapid, rx, ry, rz))
+
+    def _flush_drill_buffer(self):
+        if not getattr(self, "_drill_buffering", False):
+            return
+        buf = getattr(self, "_drill_buffer", [])
+        self._drill_buffering = False
+        self._drill_buffer = []
+        if not buf:
+            return
+
+        # Simple pattern: every FEED move changes Z only (no X/Y motion
+        # during a cutting move) - matches a clean rapid-to-position,
+        # plunge, retract drill cycle. Anything where a feed move also
+        # changes X/Y (e.g. a real helical/circular drill type) doesn't
+        # match and falls back to the proven embedded-ISO path unchanged.
+        simple = True
+        prev = buf[0]
+        for point in buf[1:]:
+            is_rapid, x, y, z = point
+            if not is_rapid and (x != prev[1] or y != prev[2]):
+                simple = False
+                break
+            prev = point
+
+        if simple:
+            self._flush_drill_buffer_native(buf)
+        else:
+            self._flush_drill_buffer_embedded_iso(buf)
+
+    def _flush_drill_buffer_native(self, buf):
+        # Detect individual hole cycles: a rapid move that changes X/Y
+        # starts a new hole; the feed moves that follow it (Z-only, per
+        # the simple-pattern check above) plunge and retract that hole.
+        tool_name = getattr(self, "_drill_tool_name", "")
+        diameter_mm = getattr(self, "_drill_diameter_mm", 0.0)
+        rpm = getattr(self, "_drill_rpm", 0)
+
+        holes = []  # list of (x, y, min_z_reached)
+        current_xy = None
+        current_min_z = None
+        for is_rapid, x, y, z in buf:
+            if is_rapid and (current_xy is None or (x, y) != current_xy):
+                if current_xy is not None and current_min_z is not None:
+                    holes.append((current_xy[0], current_xy[1], current_min_z))
+                current_xy = (x, y)
+                current_min_z = None
+            elif not is_rapid and current_xy is not None:
+                current_min_z = z if current_min_z is None else min(current_min_z, z)
+        if current_xy is not None and current_min_z is not None:
+            holes.append((current_xy[0], current_xy[1], current_min_z))
+
+        for hx, hy, hz in holes:
+            # No origin offset here, unlike the CUTOUT path - this
+            # operation's own bounds are just the tiny hole geometry
+            # itself, not the real panel, so subtracting them would
+            # incorrectly shift every hole toward (0,0). The machine's
+            # working area (used for the panel/GEO outline) is a fixed,
+            # absolute (0,0)-based frame, so raw Blender coordinates
+            # (converted to mm) are used directly.
+            # hx/hy/hz already arrive in mm - gcode_export.py applies
+            # unitcorr (meters->mm) BEFORE ever calling rapid()/feed(),
+            # which is what feeds this buffer. Multiplying by 1000.0
+            # again here was a real double-conversion bug, confirmed via
+            # real testing producing absurd values (e.g. a real ~261mm
+            # position coming out as 260959.0292).
+            real_x = hx
+            real_y = hy
+            depth_mm = abs(hz)
+            bg_id = getattr(self, "_bg_id_counter", 2001)
+            self._bg_id_counter = bg_id + 1
+            self.file.write("BEGIN MACRO\n")
+            self.file.write("        NAME=BG\n")
+            self.file.write('        PARAM,NAME=CRN,VALUE="1"\n')
+            self.file.write(f"        PARAM,NAME=X,VALUE={real_x:.4f}\n")
+            self.file.write(f"        PARAM,NAME=Y,VALUE={real_y:.4f}\n")
+            self.file.write("        PARAM,NAME=Z,VALUE=0.0000\n")
+            self.file.write(f"        PARAM,NAME=DIA,VALUE={diameter_mm:.4f}\n")
+            self.file.write(f'        PARAM,NAME=ID,VALUE="P{bg_id}"\n')
+            self.file.write(f"        PARAM,NAME=DP,VALUE={depth_mm:.4f}\n")
+            self.file.write("        PARAM,NAME=SIDE,VALUE=0\n")
+            self.file.write("        PARAM,NAME=TTP,VALUE=0\n")
+            self.file.write("        PARAM,NAME=DX,VALUE=0\n")
+            self.file.write("        PARAM,NAME=DY,VALUE=0\n")
+            self.file.write("        PARAM,NAME=R,VALUE=0\n")
+            self.file.write("        PARAM,NAME=TCL,VALUE=0\n")
+            self.file.write("        PARAM,NAME=THR,VALUE=NO\n")
+            self.file.write(f"        PARAM,NAME=RSP,VALUE={rpm:.0f}\n")
+            if tool_name:
+                self.file.write(f'        PARAM,NAME=TNM,VALUE="{tool_name}"\n')
+            self.file.write("END MACRO\n\n")
+
+    def _flush_drill_buffer_embedded_iso(self, buf):
+        # Fallback for anything not matching the simple drill pattern -
+        # emit the same placeholder-ROUT + G179 tool activation the
+        # non-CUTOUT fallback path already uses, then replay every
+        # buffered point through the normal rapid()/feed() text
+        # generation (temporarily off, so this call goes through to the
+        # base class instead of re-buffering).
+        self._write_fallback_tool_activation(
+            getattr(self, "_drill_tool_name", ""),
+            getattr(self, "_drill_diameter_mm", 12.7),
+            getattr(self, "_drill_rpm", 0),
+        )
+        for is_rapid, x, y, z in buf:
+            if is_rapid:
+                super(Creator, self).rapid(x=x, y=y, z=z)
+            else:
+                super(Creator, self).feed(x=x, y=y, z=z)
 
     def write_noprk(self, start, distance=400):
         # Native NOPRK "magic comment" directive - confirmed via real
